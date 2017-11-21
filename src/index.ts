@@ -30,7 +30,7 @@ export interface EngineConfig {
             url: string,
             headerSecret: string,
         }
-        requestTimeout?: string ,
+        requestTimeout?: string,
         maxConcurrentRequests?: number,
     }[],
     frontends?: {
@@ -88,12 +88,10 @@ export class Engine {
     private binary: string;
     private config: string | EngineConfig;
     private middlewareParams: MiddlewareParams;
-    private started: Boolean;
-    private killed: Boolean;
+    private running: Boolean;
 
     public constructor(config: SideloadConfig) {
-        this.started = false;
-        this.killed = false;
+        this.running = false;
         this.middlewareParams = new MiddlewareParams();
         this.middlewareParams.endpoint = config.endpoint || '/graphql';
         this.middlewareParams.psk = randomBytes(48).toString("hex");
@@ -129,10 +127,10 @@ export class Engine {
     }
 
     public start(): Promise<number> {
-        if (this.started) {
+        if (this.running) {
             throw new Error('Only call start() on an engine object once');
         }
-        this.started = true;
+        this.running = true;
         let config = this.config;
         const endpoint = this.middlewareParams.endpoint;
         const graphqlPort = this.graphqlPort;
@@ -185,29 +183,37 @@ export class Engine {
                     binaryPath = resolve(__dirname, '../../../node_modules', this.binary);
                 }
 
-                const childOptions = {
-                    'env': Object.assign({'ENGINE_CONFIG': JSON.stringify(childConfig)}, process.env),
-                    'maxBuffer': 5 * 1024 * 1024
-                };
-                let child = spawn(binaryPath, ['-config=env', '-restart=true'], childOptions);
-                child.stdout.pipe(this.engineLineWrapper()).pipe(process.stdout);
-                child.stderr.pipe(this.engineLineWrapper()).pipe(process.stderr);
-                child.on('exit', (code, signal) => {
-                    if (this.killed) {
-                        // It's not an error if we think it's our fault.
-                        return;
-                    }
-                    if (child != null) {
+                const childConfigJson = JSON.stringify(childConfig) + '\n';
+
+                const spawnChild = () => {
+                    const child = spawn(binaryPath, ['-config=stdin']);
+                    this.child = child;
+
+                    // Feed config into process:
+                    child.stdin.write(childConfigJson);
+
+                    // Connect log hooks:
+                    child.stdout.pipe(this.engineLineWrapper()).pipe(process.stdout);
+                    child.stderr.pipe(this.engineLineWrapper()).pipe(process.stderr);
+
+                    // Connect shutdown hooks:
+                    child.on('exit', (code, signal) => {
+                        if (!this.running) {
+                            // It's not an error if we think it's our fault.
+                            return;
+                        }
+
                         if (code != null) {
-                            throw new Error(`Engine crashed unexpectedly with code: ${code}`)
+                            console.error(`Engine crashed unexpectedly with code: ${code}`);
                         }
                         if (signal != null) {
-                            throw new Error(`Engine was killed unexpectedly by signal: ${signal}`)
+                            console.error(`Engine was killed unexpectedly by signal: ${signal}`);
                         }
-                        throw new Error("Engine crashed unexpectedly")
-                    }
-                });
-                this.child = child;
+                        spawnChild();
+                    });
+                };
+
+                spawnChild();
                 resultPort(port);
             }).listen(0);
         });
@@ -239,7 +245,7 @@ export class Engine {
         }
         const childRef = this.child;
         this.child = null;
-        this.killed = true;
+        this.running = false;
         childRef.kill();
     }
 
